@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ailist"
+version = "0.1.0"
+requires-python = ">=3.11"
+description = "LangChain-based LLM agent with MCP support and file conversion"
+readme = "README.md"
+license = { text = "MIT" }
+
+dependencies = [
+    "langchain",
+    "langchain-core",
+    "pydantic",
+    "mcp",
+    "tiktoken",
+]
+
+[project.optional-dependencies]
+
+providers = [
+    "langchain-ollama",
+    "langchain-anthropic",
+    "langchain-openai",
+    "langchain-google-genai",
+]
+
+files = [
+    "pypdf",
+    "python-docx",
+    "openpyxl",
+    "python-pptx",
+    "beautifulsoup4",
+    "lxml",
+    "faster-whisper",
+    "opencv-python",
+    "moviepy",
+    "Pillow",
+    "xhtml2pdf",
+    "markdown",
+]
+
+extras = [
+    "piper-tts",
+    "apprise",
+    "sympy",
+    "fastmcp",
+]
+
+all = [
+    "ailist[providers]",
+    "ailist[files]",
+    "ailist[extras]",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["ailist"]
