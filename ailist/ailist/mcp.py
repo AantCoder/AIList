@@ -131,6 +131,12 @@ class MCPServerDef:
     # Applies to all launcher types (npx, uvx, sse, builtin).
     # Use to hide rarely-needed or confusing tools from the model without forking the server.
     # Example: exclude_tools=["git_reflog", "git_worktree", "git_cherry_pick"]
+    builtin_tools_factory: Callable | None = None
+    # Optional factory callable(**kwargs) -> list[Tool] for launcher="builtin".
+    # When set, called at mcp_connect() time instead of using the static builtin_tools list.
+    # Allows kwargs passed to mcp_connect() to parametrize the tools at connect time.
+    # If both builtin_tools and builtin_tools_factory are set, factory takes precedence.
+    # Example: mcp_connect("workspace", exclude={"ralph.log"}, exclude_patterns=["*.log"])
     schema_patches: dict | None = None
     # Optional patches to apply to tool input schemas after fetching from the server.
     # Format: {tool_name: {param_name: {field: value, ...}, ...}}
@@ -391,7 +397,7 @@ class MCPMixin:
             result[tool_name] = entry
         return result
 
-    async def _mcp_open(self, name: str, package: str, extra: list[str], _rebuild: bool = True, url: str | None = None, env: dict | None = None, _retry: bool = True):
+    async def _mcp_open(self, name: str, package: str, extra: list[str], _rebuild: bool = True, url: str | None = None, env: dict | None = None, _retry: bool = True, factory_kwargs: dict | None = None):
         """
         Универсальное ядро подключения: предусловия, открытие сессии, регистрация, rebuild, лог.
         Не содержит никакой логики конкретных серверов -- только механику MCP.
@@ -411,7 +417,10 @@ class MCPMixin:
 
         # -- Builtin: встроенные Python-инструменты, без npx и MCP-сессии --------
         if defn is not None and defn.launcher == "builtin":
-            raw_tools = defn.builtin_tools or []
+            if defn.builtin_tools_factory is not None:
+                raw_tools = defn.builtin_tools_factory(**(factory_kwargs or {})) or []
+            else:
+                raw_tools = defn.builtin_tools or []
             tools = {
                 t.name: {
                     "description": t.description or "",
@@ -882,7 +891,7 @@ class MCPMixin:
 
         package, extra, env, url_override = self._mcp_build_args(name, **kwargs)
         effective_url = url_override or (self.MCPServers[name].url if name in self.MCPServers else None)
-        await self._mcp_open(name, package, extra, url=effective_url, env=env)
+        await self._mcp_open(name, package, extra, url=effective_url, env=env, factory_kwargs=kwargs)
 
     async def mcp_connects(self, servers: list[dict]):
         """
@@ -916,7 +925,7 @@ class MCPMixin:
             package, extra, env, url_override = self._mcp_build_args(name, **kwargs)
             effective_url = url_override or (self.MCPServers[name].url if name in self.MCPServers else None)
             # _rebuild=False -- агент пересобирается один раз после gather
-            await self._mcp_open(name, package, extra, _rebuild=False, url=effective_url, env=env)
+            await self._mcp_open(name, package, extra, _rebuild=False, url=effective_url, env=env, factory_kwargs=kwargs)
 
         results = await asyncio.gather(
             *[_connect_one(s) for s in servers],

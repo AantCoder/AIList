@@ -538,7 +538,8 @@ class AIListBase:
     Перед передачей бинарных блоков рекомендуется проверить поддержку через can_accept(block).
     """
 
-    def __init__(self, modelName, context_limit, provider: Provider = Provider.TEXT_ONLY, tools = [], context_schema=None):
+    def __init__(self, modelName, context_limit, provider: Provider = Provider.TEXT_ONLY, tools = [], context_schema=None,
+                 base_url=None, api_key=None):
         """
         Параметры:
             modelName      -- строка модели в формате LangChain init_chat_model,
@@ -555,6 +556,8 @@ class AIListBase:
             tools          -- список LangChain-инструментов (@tool) доступных агенту.
                              Передайте [] если инструменты не нужны.
             context_schema -- схема контекста для агента (опционально, передаётся в create_agent).
+            base_url       -- базовый URL для API (опционально).
+            api_key        -- ключ API для аутентификации (опционально).
         """
         # Единый замок для run/run_async и rebuild агента (_mcp_rebuild_agent).
         # threading.Lock выбран намеренно: он работает поперёк потоков и event loop-ов,
@@ -668,6 +671,8 @@ class AIListBase:
         self._model = init_chat_model(
             modelName,
             configurable_fields="any",
+            base_url=base_url,
+            api_key=api_key
         )
         self._context_schema = context_schema
         self._rebuild_agent(tools)
@@ -850,16 +855,45 @@ class AIListBase:
     # Workspace и attachments
     # -------------------------------------------------------------------------
 
+    def _resolve_workspace_path(self, path: str) -> Path:
+        """
+        Резолвит path в абсолютный Path, НЕ используя текущую рабочую директорию
+        процесса (os.getcwd()).
+
+        Относительные пути резолвятся относительно self.workspace_dir (или
+        Path.cwd(), если workspace_dir не задан -- это сохраняет старое поведение
+        "без ограничений"). Абсолютные пути нормализуются через .resolve()
+        (схлопывает "..", симлинки и т.п.) -- для абсолютного пути это не зависит
+        от CWD.
+
+        Важно: в одном процессе может одновременно работать несколько экземпляров
+        AIListBase с РАЗНЫМИ workspace_dir (разные пользователи/чаты выполняют
+        запросы конкурентно). os.getcwd() -- общий ресурс процесса, поэтому
+        резолвить относительные пути инструментов через os.chdir()+Path.resolve()
+        небезопасно (другой экземпляр может сменить CWD между вызовами). Этот
+        метод -- единая точка резолва путей для _check_workspace_path и для
+        инструментов workspace в ailist.py (_make_workspace_tools), не зависящая
+        от CWD.
+        """
+        p = Path(path)
+        if not p.is_absolute():
+            base = self.workspace_dir if self.workspace_dir is not None else Path.cwd()
+            p = base / p
+        return p.resolve()
+
     def _check_workspace_path(self, path: str) -> str | None:
         """
         Проверяет что path находится внутри self.workspace_dir.
         Возвращает None если всё в порядке, или строку с ошибкой если нарушение.
         Если workspace_dir не задан (None) -- всегда возвращает None (без ограничений).
+
+        Резолюция пути не зависит от текущей рабочей директории процесса --
+        см. _resolve_workspace_path.
         """
         if self.workspace_dir is None:
             return None
         try:
-            resolved = Path(path).resolve()
+            resolved = self._resolve_workspace_path(path)
             if not resolved.is_relative_to(self.workspace_dir):
                 return ERR_WORKSPACE_VIOLATION.format(
                     path=path, workspace=self.workspace_dir
@@ -874,8 +908,14 @@ class AIListBase:
         """
         Устанавливает рабочую директорию workspace_dir.
         Путь резолвится в абсолютный. Записывает в лог.
+
+        Также сбрасывает кэш undo-бэкапов (_workspace_backups): их ключи --
+        абсолютные пути файлов прежней директории, после смены workspace они
+        стали бы невалидными (и потенциально ссылались бы в чужую папку).
         """
         self.workspace_dir = Path(path).resolve()
+        if hasattr(self, "_workspace_backups"):
+            self._workspace_backups.clear()
         self.append_log(LOG_WORKSPACE_SET.format(path=self.workspace_dir))
 
     def get_attachments_dir(self) -> Path | None:
@@ -1536,9 +1576,15 @@ class AIListBase:
             return future.result()
     
     def prerun(self, prt):
-        # Восстанавливаем рабочую директорию в workspace_dir перед каждым запуском.
-        # Это гарантирует что относительные пути в инструментах всегда начинаются
-        # от корня workspace, даже если предыдущий вызов инструмента сменил cwd.
+        # Best-effort: восстанавливаем рабочую директорию процесса в workspace_dir.
+        # ВНИМАНИЕ: os.getcwd() -- общий ресурс процесса. Если в процессе
+        # одновременно работают несколько экземпляров AIListBase с разными
+        # workspace_dir, этот chdir НЕ гарантирует корректность для другого
+        # инстанса. Все инструменты workspace (_make_workspace_tools в ailist.py)
+        # и _check_workspace_path/_resolve_workspace_path резолвят пути явно
+        # через self.workspace_dir и от этого chdir НЕ зависят -- он остаётся
+        # только как удобство для кода, выполняемого через python_run и
+        # использующего "голые" относительные пути вместо переменной WORKSPACE.
         if self.workspace_dir is not None:
             try:
                 import os as _os_prerun

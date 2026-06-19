@@ -27,6 +27,36 @@ from .mcp import MCPMixin, MCPServerDef
 # --------------------------------------------------
 _SUBPROCESS_SAFE_MODE = True
 
+# --------------------------------------------------
+# Лимиты размера файлов и рабочей папки workspace
+#
+# WORKSPACE_FILE_LIMIT_BYTES  -- максимальный размер одного файла при записи через
+#                                 write_file / create_file / str_replace / insert.
+#                                 <= 0 отключает проверку.
+#
+# WORKSPACE_DIR_LIMIT_BYTES   -- максимальный суммарный размер всей рабочей папки.
+#                                 <= 0 отключает проверку.
+#
+# Проверка размера папки кэшируется:
+#   - пересчёт пропускается если свободное место на диске изменилось менее чем на
+#     WORKSPACE_DIR_FREE_DELTA_BYTES (20 МБ) с момента последнего пересчёта;
+#   - кэш принудительно сбрасывается через WORKSPACE_DIR_CACHE_TTL_SEC (10 мин).
+# --------------------------------------------------
+WORKSPACE_FILE_LIMIT_BYTES:      int = 50 * 1024 * 1024   # 50 МБ
+WORKSPACE_DIR_LIMIT_BYTES:       int = 1024 * 1024 * 1024 # 1 ГБ
+WORKSPACE_DIR_FREE_DELTA_BYTES:  int = 20 * 1024 * 1024   # 20 МБ — порог пропуска пересчёта
+WORKSPACE_DIR_CACHE_TTL_SEC:     int = 600                 # 10 минут
+
+# Сообщения об ошибках лимитов (используются внутри workspace-инструментов)
+ERR_WS_FILE_TOO_LARGE = (
+    "[error: file size {size} bytes exceeds limit {limit} bytes. "
+    "Write refused to prevent disk overflow.]"
+)
+ERR_WS_DIR_TOO_LARGE = (
+    "[error: workspace size {size} bytes exceeds limit {limit} bytes. "
+    "Write refused to prevent disk overflow.]"
+)
+
 @tool
 def sympy_solve(expression: str, variable: str = "x") -> str:
     """
@@ -446,7 +476,77 @@ class AIList(MCPMixin, AIListBase):
         finally:
             self.systems = saved
 
-    def _make_workspace_tools(self):
+    def _check_workspace_write(self, content_len: int = 0) -> str | None:
+        """
+        Проверяет лимиты перед записью файла:
+        1. Размер записываемого контента (content_len) против WORKSPACE_FILE_LIMIT_BYTES.
+        2. Суммарный размер папки workspace против WORKSPACE_DIR_LIMIT_BYTES.
+
+        Размер папки кэшируется:
+          - пропускает пересчёт если free disk изменился < WORKSPACE_DIR_FREE_DELTA_BYTES
+            с момента прошлого измерения И не истёк TTL кэша.
+          - сбрасывает кэш через WORKSPACE_DIR_CACHE_TTL_SEC секунд.
+
+        Возвращает None если всё в порядке, или строку ошибки если лимит превышен.
+        Если workspace_dir не задан — всегда None.
+        """
+        import time as _time
+        import shutil as _shutil_ws
+        import os as _os_ws
+
+        # -- Лимит одного файла --
+        if WORKSPACE_FILE_LIMIT_BYTES > 0 and content_len > WORKSPACE_FILE_LIMIT_BYTES:
+            return ERR_WS_FILE_TOO_LARGE.format(
+                size=content_len, limit=WORKSPACE_FILE_LIMIT_BYTES
+            )
+
+        # -- Лимит папки --
+        if WORKSPACE_DIR_LIMIT_BYTES <= 0 or self.workspace_dir is None:
+            return None
+
+        now = _time.monotonic()
+        ttl_expired = (now - self._ws_size_cache_time) > WORKSPACE_DIR_CACHE_TTL_SEC
+
+        # Текущее свободное место на диске
+        try:
+            free_now = _shutil_ws.disk_usage(self.workspace_dir).free
+        except Exception:
+            return None  # не можем проверить — пропускаем
+
+        free_changed = abs(free_now - self._ws_free_cache) >= WORKSPACE_DIR_FREE_DELTA_BYTES
+
+        if ttl_expired or free_changed or self._ws_free_cache < 0:
+            # Пересчитываем размер папки
+            total = 0
+            try:
+                for entry in _os_ws.scandir(self.workspace_dir):
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            total += entry.stat().st_size
+                        elif entry.is_dir(follow_symlinks=False):
+                            for root, _dirs, files in _os_ws.walk(entry.path):
+                                for f in files:
+                                    try:
+                                        total += _os_ws.path.getsize(_os_ws.path.join(root, f))
+                                    except OSError:
+                                        pass
+                    except OSError:
+                        pass
+            except Exception:
+                return None
+
+            self._ws_size_cache = total
+            self._ws_free_cache = free_now
+            self._ws_size_cache_time = now
+
+        if self._ws_size_cache > WORKSPACE_DIR_LIMIT_BYTES:
+            return ERR_WS_DIR_TOO_LARGE.format(
+                size=self._ws_size_cache, limit=WORKSPACE_DIR_LIMIT_BYTES
+            )
+
+        return None
+
+    def _make_workspace_tools(self, exclude: set[str] | None = None, exclude_patterns: list[str] | None = None):
         """
         Creates all built-in workspace tools bound to this instance.
 
@@ -479,6 +579,18 @@ class AIList(MCPMixin, AIListBase):
 
         def _check(path: str) -> str | None:
             return _self._check_workspace_path(path)
+
+        def _resolve(path: str) -> str:
+            """
+            Абсолютный путь для файловых I/O-операций, НЕ зависящий от текущей
+            рабочей директории процесса (os.getcwd()). Вызывать после успешной
+            проверки _check(path). Для сообщений/логов продолжаем использовать
+            исходный (возможно относительный) `path`, как и раньше.
+            """
+            return str(_self._resolve_workspace_path(path))
+
+        def _check_write(content: str) -> str | None:
+            return _self._check_workspace_write(len(content.encode("utf-8")))
 
         def _backup(path: str):
             if path not in _backups:
@@ -513,10 +625,12 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                if not Path(path).exists():
+                abs_path = _resolve(path)
+                if not Path(abs_path).exists():
                     return ERR_EDITOR_FILE_NOT_FOUND.format(path=path)
-                with open(path, "r", encoding="utf-8") as f:
+                with open(abs_path, "r", encoding="utf-8") as f:
                     lines = f.readlines()
+                total_lines = len(lines)
                 if start_line > 0 or end_line != -1:
                     s = max(0, start_line - 1)
                     e = end_line if end_line != -1 else len(lines)
@@ -524,7 +638,15 @@ class AIList(MCPMixin, AIListBase):
                     base = start_line if start_line > 0 else 1
                 else:
                     base = 1
-                return "".join(f"{base + i}\t{line}" for i, line in enumerate(lines))
+                result = "".join(f"{base + i}\t{line}" for i, line in enumerate(lines))
+                # Мягкое предупреждение для больших файлов (только при чтении всего файла)
+                if (start_line == 0 and end_line == -1 and total_lines > 300):
+                    result += (
+                        f"\n[NOTE: file has {total_lines} lines. "
+                        f"Use view(path, start_line=N, end_line=M) to read specific sections, "
+                        f"or grep/head/tail to navigate large files.]"
+                    )
+                return result
             except Exception as exc:
                 return ERR_EDITOR_VIEW.format(e=exc)
 
@@ -547,7 +669,8 @@ class AIList(MCPMixin, AIListBase):
                     parts.append(f"--- File: {path} ---\n{ws_err}")
                     continue
                 try:
-                    with open(path, "r", encoding="utf-8") as f:
+                    abs_path = _resolve(path)
+                    with open(abs_path, "r", encoding="utf-8") as f:
                         content = f.read()
                     parts.append(f"--- File: {path} ---\n{content}")
                 except Exception as exc:
@@ -573,18 +696,23 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                if not Path(path).exists():
+                abs_path = _resolve(path)
+                if not Path(abs_path).exists():
                     return ERR_EDITOR_FILE_NOT_FOUND.format(path=path)
-                with open(path, "r", encoding="utf-8") as f:
+                with open(abs_path, "r", encoding="utf-8") as f:
                     content = f.read()
                 count = content.count(old_str)
                 if count == 0:
                     return ERR_EDITOR_TEXT_NOT_FOUND.format(path=path)
                 if count > 1:
                     return ERR_EDITOR_MULTIPLE_MATCHES.format(count=count, path=path)
-                _backup(path)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(content.replace(old_str, new_str, 1))
+                new_content = content.replace(old_str, new_str, 1)
+                ws_err = _check_write(new_content)
+                if ws_err:
+                    return ws_err
+                _backup(abs_path)
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(new_content)
                 return MSG_EDITOR_REPLACED
             except Exception as exc:
                 return ERR_EDITOR_REPLACE.format(e=exc)
@@ -605,11 +733,15 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                p = Path(path)
+                abs_path = _resolve(path)
+                p = Path(abs_path)
                 if p.exists():
                     return ERR_EDITOR_FILE_EXISTS.format(path=path)
+                ws_err = _check_write(content)
+                if ws_err:
+                    return ws_err
                 p.parent.mkdir(parents=True, exist_ok=True)
-                with open(path, "w", encoding="utf-8") as f:
+                with open(abs_path, "w", encoding="utf-8") as f:
                     f.write(content)
                 return MSG_EDITOR_CREATED.format(path=path)
             except Exception as exc:
@@ -632,11 +764,15 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                p = Path(path)
+                ws_err = _check_write(content)
+                if ws_err:
+                    return ws_err
+                abs_path = _resolve(path)
+                p = Path(abs_path)
                 if p.exists():
-                    _backup(path)
+                    _backup(abs_path)
                 p.parent.mkdir(parents=True, exist_ok=True)
-                with open(path, "w", encoding="utf-8") as f:
+                with open(abs_path, "w", encoding="utf-8") as f:
                     f.write(content)
                 return MSG_WS_FILE_WRITTEN.format(path=path)
             except Exception as exc:
@@ -661,16 +797,21 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                if not Path(path).exists():
+                abs_path = _resolve(path)
+                if not Path(abs_path).exists():
                     return ERR_EDITOR_FILE_NOT_FOUND.format(path=path)
-                with open(path, "r", encoding="utf-8") as f:
+                with open(abs_path, "r", encoding="utf-8") as f:
                     lines = f.readlines()
                 if line > len(lines):
                     return ERR_EDITOR_LINE_EXCEEDS.format(line=line, length=len(lines))
-                _backup(path)
                 text = content if content.endswith("\n") else content + "\n"
+                new_content = "".join(lines[:line]) + text + "".join(lines[line:])
+                ws_err = _check_write(new_content)
+                if ws_err:
+                    return ws_err
+                _backup(abs_path)
                 lines.insert(line, text)
-                with open(path, "w", encoding="utf-8") as f:
+                with open(abs_path, "w", encoding="utf-8") as f:
                     f.writelines(lines)
                 return MSG_EDITOR_INSERTED.format(line=line)
             except Exception as exc:
@@ -690,10 +831,11 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                if path not in _backups:
+                abs_path = _resolve(path)
+                if abs_path not in _backups:
                     return ERR_EDITOR_NO_BACKUP.format(path=path)
-                with open(path, "w", encoding="utf-8") as f:
-                    f.write(_backups.pop(path))
+                with open(abs_path, "w", encoding="utf-8") as f:
+                    f.write(_backups.pop(abs_path))
                 return MSG_EDITOR_RESTORED.format(path=path)
             except Exception as exc:
                 return ERR_EDITOR_UNDO.format(e=exc)
@@ -714,13 +856,13 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                p = Path(path)
+                p = Path(_resolve(path))
                 if not p.exists() or not p.is_dir():
                     return ERR_WS_DIR_NOT_FOUND.format(path=path)
                 lines = []
                 for item in sorted(p.iterdir(), key=lambda x: (x.is_file(), x.name.lower())):
                     tag = "[dir] " if item.is_dir() else "      "
-                    lines.append(f"{tag}{item.name}")
+                    lines.append(f"{tag}{item}")
                 return "\n".join(lines) if lines else "(empty)"
             except Exception as exc:
                 return ERR_WS_READ_FAILED.format(e=exc)
@@ -739,21 +881,20 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                p = Path(path)
+                p = Path(_resolve(path))
                 if not p.exists() or not p.is_dir():
                     return ERR_WS_DIR_NOT_FOUND.format(path=path)
                 # Директории которые не нужны ни модели ни пользователю
                 SKIP_DIRS = {".git", "__pycache__", "node_modules", ".venv", "venv"}
                 lines = []
-                for root, dirs, files in _os.walk(path):
+                for root, dirs, files in _os.walk(str(p)):
                     # Мутируем dirs на месте — os.walk не будет заходить в исключённые папки
                     dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
-                    rel = _os.path.relpath(root, path)
-                    prefix = "" if rel == "." else rel + _os.sep
+                    root_path = Path(root)
                     for d in dirs:
-                        lines.append(f"[dir] {prefix}{d}")
+                        lines.append(f"[dir] {root_path / d}")
                     for f in sorted(files):
-                        lines.append(f"      {prefix}{f}")
+                        lines.append(f"      {root_path / f}")
                 return "\n".join(lines) if lines else "(empty)"
             except Exception as exc:
                 return ERR_WS_READ_FAILED.format(e=exc)
@@ -773,10 +914,10 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(root)
                 if ws_err:
                     return ws_err
-                p = Path(root)
+                p = Path(_resolve(root))
                 if not p.exists():
                     return ERR_WS_DIR_NOT_FOUND.format(path=root)
-                matches = sorted(str(m) for m in p.rglob(pattern))
+                matches = sorted(str(m.resolve()) for m in p.rglob(pattern))
                 return "\n".join(matches) if matches else "(no files found)"
             except Exception as exc:
                 return ERR_WS_READ_FAILED.format(e=exc)
@@ -796,7 +937,7 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                p = Path(path)
+                p = Path(_resolve(path))
                 if not p.exists():
                     return ERR_EDITOR_FILE_NOT_FOUND.format(path=path)
                 st = p.stat()
@@ -824,7 +965,7 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                Path(path).mkdir(parents=True, exist_ok=True)
+                Path(_resolve(path)).mkdir(parents=True, exist_ok=True)
                 return MSG_WS_DIR_CREATED.format(path=path)
             except Exception as exc:
                 return ERR_WS_MKDIR_FAILED.format(e=exc)
@@ -845,7 +986,7 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(dst)
                 if ws_err:
                     return ws_err
-                _shutil.move(src, dst)
+                _shutil.move(_resolve(src), _resolve(dst))
                 return MSG_WS_MOVED.format(src=src, dst=dst)
             except Exception as exc:
                 return ERR_WS_MOVE_FAILED.format(e=exc)
@@ -872,9 +1013,10 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                if not Path(path).exists():
+                abs_path = _resolve(path)
+                if not Path(abs_path).exists():
                     return ERR_EDITOR_FILE_NOT_FOUND.format(path=path)
-                with open(path, "r", encoding="utf-8") as f:
+                with open(abs_path, "r", encoding="utf-8") as f:
                     lines = f.readlines()
                 rx = _re.compile(pattern)
                 match_indices = [i for i, l in enumerate(lines) if rx.search(l)]
@@ -915,16 +1057,52 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                p = Path(path)
+                p = Path(_resolve(path))
                 if not p.exists():
                     return ERR_EDITOR_FILE_NOT_FOUND.format(path=path)
                 rx = _re.compile(pattern)
                 results = []
 
+                # Бинарные расширения — пропускаем содержимое, выдаём заглушку при совпадении имени
+                _BINARY_EXT = {
+                    ".zip", ".tar", ".gz", ".bz2", ".xz", ".7z", ".rar",
+                    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico", ".webp", ".svg",
+                    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+                    ".exe", ".dll", ".so", ".dylib", ".bin", ".dat",
+                    ".mp3", ".mp4", ".wav", ".ogg", ".avi", ".mov",
+                    ".woff", ".woff2", ".ttf", ".eot",
+                    ".pyc", ".pyd", ".pyo",
+                }
+                # Максимальный размер файла для поиска (1 МБ)
+                _MAX_FILE_BYTES = 1 * 1024 * 1024
+                # Максимальное количество строк результата
+                _MAX_RESULT_LINES = 200
+
                 def _search_file(fp):
+                    fp = Path(fp)
+                    # Пропускаем файлы из списка исключений
+                    if exclude and fp.name in exclude:
+                        return
+                    if exclude_patterns and any(_fnmatch.fnmatch(fp.name, p) for p in exclude_patterns):
+                        return
+                    # Пропускаем бинарные по расширению
+                    if fp.suffix.lower() in _BINARY_EXT:
+                        if rx.search(fp.name):
+                            results.append(f"{fp}: [binary file, content skipped]")
+                        return
+                    # Пропускаем слишком большие файлы
+                    try:
+                        if fp.stat().st_size > _MAX_FILE_BYTES:
+                            results.append(f"{fp}: [file too large ({fp.stat().st_size} bytes), skipped]")
+                            return
+                    except OSError:
+                        return
                     try:
                         with open(fp, "r", encoding="utf-8", errors="replace") as f:
                             for i, line in enumerate(f, 1):
+                                if len(results) >= _MAX_RESULT_LINES:
+                                    results.append(f"[... truncated: more than {_MAX_RESULT_LINES} matches ...]")
+                                    return
                                 if rx.search(line):
                                     results.append(f"{fp}:{i}: {line.rstrip()}")
                     except Exception:
@@ -934,6 +1112,9 @@ class AIList(MCPMixin, AIListBase):
                     _search_file(p)
                 else:
                     for fp in sorted(p.rglob("*")):
+                        if len(results) >= _MAX_RESULT_LINES:
+                            results.append(f"[... truncated: more than {_MAX_RESULT_LINES} matches ...]")
+                            break
                         if fp.is_file():
                             _search_file(fp)
                 return "\n".join(results) if results else "(no matches)"
@@ -953,9 +1134,10 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                if not Path(path).exists():
+                abs_path = _resolve(path)
+                if not Path(abs_path).exists():
                     return ERR_EDITOR_FILE_NOT_FOUND.format(path=path)
-                with open(path, "r", encoding="utf-8") as f:
+                with open(abs_path, "r", encoding="utf-8") as f:
                     lines = f.readlines()[:n]
                 return "".join(f"{i+1}\t{l}" for i, l in enumerate(lines))
             except Exception as exc:
@@ -974,9 +1156,10 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                if not Path(path).exists():
+                abs_path = _resolve(path)
+                if not Path(abs_path).exists():
                     return ERR_EDITOR_FILE_NOT_FOUND.format(path=path)
-                with open(path, "r", encoding="utf-8") as f:
+                with open(abs_path, "r", encoding="utf-8") as f:
                     all_lines = f.readlines()
                 lines = all_lines[-n:]
                 base = max(1, len(all_lines) - n + 1)
@@ -999,9 +1182,10 @@ class AIList(MCPMixin, AIListBase):
                 ws_err = _check(path)
                 if ws_err:
                     return ws_err
-                if not Path(path).exists():
+                abs_path = _resolve(path)
+                if not Path(abs_path).exists():
                     return ERR_EDITOR_FILE_NOT_FOUND.format(path=path)
-                with open(path, "r", encoding="utf-8") as f:
+                with open(abs_path, "r", encoding="utf-8") as f:
                     text = f.read()
                 lines = text.count("\n")
                 words = len(text.split())
@@ -1039,7 +1223,7 @@ class AIList(MCPMixin, AIListBase):
                 err = _self._check_workspace_path(cwd)
                 if err:
                     return err
-                effective_cwd = cwd
+                effective_cwd = str(_self._resolve_workspace_path(cwd))
             elif _self.workspace_dir is not None:
                 effective_cwd = str(_self.workspace_dir)
             else:
@@ -1272,7 +1456,8 @@ class AIList(MCPMixin, AIListBase):
 
     # -- Инициализация -----------------------------------------------------
 
-    def __init__(self, modelName: str, context_limit: int, provider, tools: list, context_schema=None):
+    def __init__(self, modelName: str, context_limit: int, provider, tools: list, context_schema=None,
+                 base_url=None, api_key=None):
         # _static_tools нужен MCPMixin для пересборки агента
         self._static_tools = list(tools)
 
@@ -1285,7 +1470,7 @@ class AIList(MCPMixin, AIListBase):
         # Абсолютный путь используется как есть; относительный -- от workspace_dir.
         self.skills_dir: str = "skills"
 
-        super().__init__(modelName, context_limit, provider, tools, context_schema)
+        super().__init__(modelName, context_limit, provider, tools, context_schema, base_url, api_key)
 
         # -- Policy prompts ------------------------------------------------
         # Negative keys keep these blocks before any user-added systems[N>=0].
@@ -1343,6 +1528,13 @@ Rules:
         # The cache is invalidated when workspace_dir, skills_dir, or systems change.
         self._prompt_vars_cache_key: tuple = ()
         self._prompt_vars_resolved:  dict  = {}
+
+        # -- Workspace size cache -----------------------------------------
+        # Кэшируем суммарный размер папки чтобы не пересчитывать на каждую запись.
+        # Обновляется только если свободное место на диске изменилось > delta или истёк TTL.
+        self._ws_size_cache:      int   = 0    # последний измеренный размер папки, байт
+        self._ws_free_cache:      int   = -1   # последнее измеренное free disk, байт (-1 = не измерялось)
+        self._ws_size_cache_time: float = 0.0  # время последнего пересчёта (time.monotonic)
 
         # -- Piper TTS -----------------------------------------------------
         # Объект для синтеза речи. Настройки меняются через атрибуты:
@@ -1413,7 +1605,7 @@ Rules:
                     "navigate directories. All paths must be within the workspace."
                 ),
                 launcher      = "builtin",
-                builtin_tools = self._make_workspace_tools(),
+                builtin_tools_factory = self._make_workspace_tools,
                 system_prompt = (
                     "FILE EDITING WORKFLOW:\n"
                     "1. LOCATE -- use grep(file, pattern) to find the exact line.\n"

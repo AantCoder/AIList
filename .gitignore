@@ -3,6 +3,9 @@ piper_modules
 __pycache__
 .serena
 .vscode
-/tests/test_files/raw
-/tests/t2v
+/ailist/tests/test_files/raw
+/ailist/tests/t2v
+/ralph/ralph_project*
 /Dev
+.git_
+.git__
